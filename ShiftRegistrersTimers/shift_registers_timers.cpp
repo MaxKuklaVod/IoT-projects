@@ -1,215 +1,200 @@
 /*
- * Seven Segment Cascade Control via Shift Registers
- * Target: ATmega328P (Arduino Uno)
- *
- * Описание:
- * Управление двумя семисегментными индикаторами через два регистра 74HC595.
- * Используется Timer1 для подсчета времени и программного SPI (bit-banging)
- * внутри прерывания, что обеспечивает неблокирующую работу.
- *
- * Подключение (настраивается в макросах PORTB):
- * DATA  (DS)    -> Pin 8  (PB0)
- * CLOCK (SH_CP) -> Pin 9  (PB1)
- * LATCH (ST_CP) -> Pin 10 (PB2)
- *
- * Логика каскада:
- * Данные передаются последовательно (MSB first).
- * Первые 8 бит уйдут во ВТОРОЙ регистр (десятки).
- * Вторые 8 бит останутся в ПЕРВОМ регистре (единицы).
+ * Seven Segment Stopwatch with Override
+ * Logic:
+ * 1. Start: Wait for Serial input.
+ * 2. Normal: Count up every second.
+ * 3. User Input:
+ *    - First time: Sets the start time (e.g., 42).
+ *    - Next times: Overrides display for ONE second only (sequence continues in background).
  */
 
-#include <HardwareSerial.h>
-#include <avr/interrupt.h>
 #include <avr/io.h>
+#include <avr/interrupt.h>
 
-// Тип индикатора: true для Общего Анода, false для Общего Катода
-constexpr bool COMMON_ANODE = true;
+int latchPin = 5;
+int clockPin = 3;
+int dataPin = 7;
 
-// Пины порта B (Arduino D8-D13)
-#define DATA_PIN  PB0  // Arduino D8
-#define CLOCK_PIN PB1  // Arduino D9
-#define LATCH_PIN PB2  // Arduino D10
-
-// Прямое управление портами (макросы для удобства)
-#define DATA_HIGH  PORTB |= (1 << DATA_PIN)
-#define DATA_LOW   PORTB &= ~(1 << DATA_PIN)
-#define CLOCK_HIGH PORTB |= (1 << CLOCK_PIN)
-#define CLOCK_LOW  PORTB &= ~(1 << CLOCK_PIN)
-#define LATCH_HIGH PORTB |= (1 << LATCH_PIN)
-#define LATCH_LOW  PORTB &= ~(1 << LATCH_PIN)
-
-// Кодировка цифр 0-9 для 7-сегментного индикатора
-// Формат: ABCDEFG DP (или аналогичный в зависимости от разводки)
-// Обычно: A=bit0, B=bit1, ..., G=bit6
-const uint8_t digit_map[10] = {
-	0b00111111, // 0
-	0b00000110, // 1
-	0b01011011, // 2
-	0b01001111, // 3
-	0b01100110, // 4
-	0b01101101, // 5
-	0b01111101, // 6
-	0b00000111, // 7
-	0b01111111, // 8
-	0b01101111 // 9
+bool digits[10][8] = {
+  {1,1,0,1,1,1,0,1},  // 0
+  {0,1,0,1,0,0,0,0},  // 1
+  {1,1,0,0,1,1,1,0},  // 2
+  {1,1,0,1,1,0,1,0},  // 3
+  {0,1,0,1,0,0,1,1},  // 4
+  {1,0,0,1,1,0,1,1},  // 5
+  {1,0,1,1,1,1,1,1},  // 6
+  {1,1,0,1,0,0,0,0},  // 7
+  {1,1,0,1,1,1,1,1},  // 8
+  {1,1,1,1,1,0,1,1}   // 9
 };
 
-// Переменные для обмена данными между ISR и Loop
-// volatile обязательно, так как они меняются в прерывании
-volatile uint8_t current_seconds = 0; // Текущее отображаемое время
-volatile uint8_t next_seconds = 1; // Следующее значение (подготовленное)
-volatile uint16_t shift_buffer = 0; // Буфер битов для передачи (16 бит)
+volatile int internal_counter = 0;
+volatile int override_value = -1;
+volatile bool system_running = false;
 
-// Состояния машины состояний внутри таймера
-enum State { IDLE, SHIFTING, LATCHING };
+volatile uint16_t shift_buffer = 0;  // 16 бит для отправки
+volatile int bit_index = 15;         // Какой бит сейчас отправляем
+volatile int ms_counter = 0;         // Счетчик миллисекунд
 
-volatile State tx_state = IDLE;
-volatile int8_t bit_index = 15; // Индекс текущего бита (15 до 0)
-volatile uint16_t ms_counter = 0; // Счётчик миллисекунд для секундомера
+enum State { STATE_WAIT, STATE_SHIFT, STATE_LATCH };
+volatile State current_state = STATE_WAIT;
 
-void setup()
-{
-	// 1. Настройка пинов на выход
-	DDRB |= (1 << DATA_PIN) | (1 << CLOCK_PIN) | (1 << LATCH_PIN);
+void setup() {
+  pinMode(latchPin, OUTPUT);
+  pinMode(dataPin, OUTPUT);  
+  pinMode(clockPin, OUTPUT);
+  
+  digitalWrite(clockPin, LOW);
+  digitalWrite(latchPin, HIGH);
+  
+  Serial.begin(9600);
+  Serial.println(F("SYSTEM READY. Send start value (e.g. 42)..."));
 
-	// Начальное состояние
-	LATCH_LOW;
-	CLOCK_LOW;
-
-	// 2. Настройка последовательного порта (UART)
-	Serial.begin(9600);
-	Serial.println(F("System Ready. Enter start value (00-99):"));
-
-	// 3. Настройка Timer1 (16-бит)
-	// Цель: Прерывание с частотой 1 кГц (1 мс)
-	// F_CPU = 16 MHz. Prescaler = 64.
-	// 16,000,000 / 64 = 250,000 тиков в секунду
-	// Для 1000 Гц нужно делить на 250.
-	// OCR1A = 250 - 1 = 249.
-
-	cli(); // Отключить прерывания на время настройки
-
-	TCCR1A = 0; // Обычный режим (не PWM)
-	TCCR1B = 0;
-	TCNT1 = 0; // Сброс счетчика
-
-	OCR1A = 249; // Значение сравнения для 1 мс
-	TCCR1B |= (1 << WGM12); // Режим CTC (Clear Timer on Compare Match)
-	TCCR1B |= (1 << CS11) | (1 << CS10); // Предделитель 64
-	TIMSK1 |= (1 << OCIE1A); // Разрешить прерывание по совпадению A
-
-	sei(); // Включить глобальные прерывания
+  cli(); // Отключить прерывания
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
+  
+  // OCR1A = (16*10^6) / (64 * 1000) - 1 = 249
+  OCR1A = 249;            
+  TCCR1B |= (1 << WGM12);   // CTC режим
+  TCCR1B |= (1 << CS11) | (1 << CS10);  // Prescaler 64
+  TIMSK1 |= (1 << OCIE1A);  // Включить прерывание по совпадению A
+  sei(); // Включить прерывания
 }
 
-void loop()
-{
-	// Главный цикл занимается только обработкой пользовательского ввода.
-	// Вся логика отображения и счета времени вынесена в таймеры.
+void loop() {
+  static char input_buf[3]; 
+  static byte pos = 0;
 
-	static char input_buf[3]; // Буфер для двух цифр + null terminator
-	static uint8_t input_pos = 0;
-
-	if (Serial.available() > 0)
-	{
-		char c = Serial.read();
-
-		// Если это цифра
-		if (c >= '0' && c <= '9') { if (input_pos < 2) { input_buf[input_pos++] = c; } }
-
-		// Если ввод завершен (получено 2 цифры или перевод строки)
-		// Упрощенная логика: как только получили 2 цифры -> применяем
-		if (input_pos == 2)
-		{
-			input_buf[2] = '\0';
-			int val = atoi(input_buf);
-
-			if (val >= 0 && val <= 99)
-			{
-				// КРИТИЧЕСКАЯ СЕКЦИЯ: атомарное обновление
-				// Мы меняем next_seconds, которое читается в ISR
-				cli();
-				next_seconds = val;
-				sei();
-
-				Serial.print(F("Next value set to: "));
-				Serial.println(val);
-			}
-
-			// Сброс буфера
-			input_pos = 0;
-		}
-
-		// Сброс по переводу строки для удобства (если ввели одну цифру и Enter)
-		if (c == '\n' || c == '\r') { input_pos = 0; }
-	}
+  if (Serial.available()) {
+    char c = Serial.read();
+    
+    if (c >= '0' && c <= '9') {
+      if (pos < 2) input_buf[pos++] = c;
+    }
+    
+    // Обработка ввода (Enter или 2 цифры)
+    if (pos == 2 || c == '\n') {
+      input_buf[pos] = 0;
+      int val = atoi(input_buf);
+      
+      if (val >= 0 && val <= 99) {
+        // меняем переменные, используемые в прерывании
+        cli();
+        
+        if (!system_running) {
+          // ПЕРВЫЙ ЗАПУСК
+          internal_counter = val;    // Устанавливаем начальное время
+          system_running = true;     // Запускаем часы
+          ms_counter = 999;          // Форсируем обновление дисплея прямо сейчас
+          Serial.print(F("STARTED at: ")); Serial.println(val);
+        } else {
+          // ПОДМЕНА (Override)
+          override_value = val;      // Записываем значение для "глюка"
+          // Внутренний internal_counter НЕ МЕНЯЕМ!
+          Serial.print(F("OVERRIDE next frame with: ")); Serial.println(val);
+        }
+        
+        sei();
+      }
+      pos = 0;
+    }
+  }
 }
 
-// --- Обработчик прерывания Timer1 (1 кГц) ---
-ISR(TIMER1_COMPA_vect)
-{
-	ms_counter++;
+// Вспомогательная функция для сборки 16 бит из массива digits
+uint16_t encode_number(int number) {
+  int tens = number / 10;
+  int ones = number % 10;
+  
+  uint16_t bits = 0;
+  
+  // Сначала загружаем Единицы (они уйдут в первый регистр/дальний)
+  // Или Десятки, в зависимости от порядка подключения.
+  // Логика каскада: Первый отправленный бит уползает в самый конец.
+  
+  // Добавляем биты Десятков (старший байт)
+  for(int i=7; i>=0; i--) {
+     if(digits[tens][i]) bits |= (1 << (8 + i));
+  }
+  
+  // Добавляем биты Единиц (младший байт)
+  for(int i=7; i>=0; i--) {
+     if(digits[ones][i]) bits |= (1 << i);
+  }
+  
+  return bits;
+}
 
-	// 1. Логика секундомера (раз в 1000 мс)
-	if (ms_counter >= 1000)
-	{
-		ms_counter = 0;
+// --- ПРЕРЫВАНИЕ ТАЙМЕРА (1000 раз в секунду) ---
+ISR(TIMER1_COMPA_vect) {
+  // 1. Считаем миллисекунды
+  ms_counter++;
 
-		// Обновляем текущее значение на подготовленное
-		current_seconds = next_seconds;
+  // 2. Логика Секундомера (раз в секунду)
+  if (ms_counter >= 1000) {
+    ms_counter = 0;
+    
+    if (system_running) {
+      // Определяем, что показать
+      int value_to_show;
+      
+      if (override_value != -1) {
+        // Если есть задание на подмену - показываем его
+        value_to_show = override_value;
+        override_value = -1; // Сбрасываем подмену (одноразовая)
+        
+        // ВАЖНО: Мы все равно увеличиваем внутренний счетчик, 
+        // чтобы "время шло" в фоне
+        internal_counter++; 
+      } else {
+        // Обычный режим
+        value_to_show = internal_counter;
+        internal_counter++;
+      }
 
-		// Готовим следующее значение (автоинкремент)
-		// Если пользователь не вмешается, оно будет использовано через секунду
-		next_seconds++;
-		if (next_seconds > 99) next_seconds = 0;
+      if (internal_counter > 99) internal_counter = 0; // Цикл 0-99
 
-		// Подготовка битовой маски для отображения (Decoding)
-		const uint8_t tens = current_seconds / 10;
-		const uint8_t ones = current_seconds % 10;
+      // Подготовка данных для сдвига
+      shift_buffer = encode_number(value_to_show);
+      
+      // Запуск процесса передачи
+      current_state = STATE_SHIFT;
+      bit_index = 15; // 16 бит (0..15)
+    }
+  }
 
-		uint8_t seg_tens = digit_map[tens];
-		uint8_t seg_ones = digit_map[ones];
+  // 3. Машина состояний для управления пинами (Shift Register)
+  switch (current_state) {
+    case STATE_SHIFT:
+      // Выставляем бит данных
+      if ((shift_buffer >> bit_index) & 1) {
+        PORTD |= (1 << 7); // Data Pin 7 HIGH
+      } else {
+        PORTD &= ~(1 << 7); // Data Pin 7 LOW
+      }
+      
+      // Дергаем Clock (Pin 3)
+      PORTD |= (1 << 3);  // Clock HIGH
+      PORTD &= ~(1 << 3); // Clock LOW
+      
+      bit_index--;
+      if (bit_index < 0) {
+        current_state = STATE_LATCH;
+      }
+      break;
 
-		// Инверсия для общего анода
-		if (COMMON_ANODE)
-		{
-			seg_tens = ~seg_tens;
-			seg_ones = ~seg_ones;
-		}
+    case STATE_LATCH:
+      // Дергаем Latch (Pin 5) чтобы обновить дисплей
+      PORTD |= (1 << 5);  // Latch HIGH
+      PORTD &= ~(1 << 5); // Latch LOW
+      
+      current_state = STATE_WAIT; // Ждем следующей секунды
+      break;
 
-		// Формируем 16-битное число для сдвига.
-		// При каскадировании первый переданный байт (MSB 16-битного слова)
-		// "проталкивается" во второй регистр (дальний от Arduino).
-		// Поэтому старший байт -> Десятки, Младший байт -> Единицы.
-		shift_buffer = (seg_tens << 8) | seg_ones;
-
-		// Запускаем процесс передачи данных
-		tx_state = SHIFTING;
-		bit_index = 15; // Начинаем со старшего бита
-	}
-
-	// 2. Машина состояний для SPI (программная реализация)
-	// Работает каждый тик таймера (1мс), пока идет передача.
-	// Это обеспечивает обновление регистров без delay().
-
-	if (tx_state == SHIFTING)
-	{
-		// Установка линии DATA
-		if ((shift_buffer >> bit_index) & 0x01) { DATA_HIGH; } else { DATA_LOW; }
-
-		// Импульс Clock (достаточно короткий, можно в одном прерывании)
-		// 74HC595 работает на частотах МГц, переключение портов занимает наносекунды
-		CLOCK_HIGH;
-		CLOCK_LOW;
-
-		bit_index--;
-
-		if (bit_index < 0) { tx_state = LATCHING; }
-	} else if (tx_state == LATCHING)
-	{
-		// Импульс Latch для вывода данных на выходы регистров
-		LATCH_HIGH;
-		LATCH_LOW;
-
-		tx_state = IDLE; // Передача завершена, ждем следующей секунды
-	}
+    case STATE_WAIT:
+      // Ничего не делаем, ждем
+      break;
+  }
 }
