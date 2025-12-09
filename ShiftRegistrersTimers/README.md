@@ -67,3 +67,7 @@
 4. Откройте Монитор порта (9600 бод).
 5. Индикатор начнет счет с 00. Введите любое число (например, `45`) и нажмите Enter. При следующей смене секунды счетчик
    перепрыгнет на 45.
+
+### Результат
+
+[TinkerCad](https://www.tinkercad.com/things/6QaUWt594Jp-copy-of-cascadingregisters?sharecode=pieWSUzt4mb5kvPxKMGuKBn47gizOVzZVRj-nNtr2mo) - ссылка на пример работы кода
