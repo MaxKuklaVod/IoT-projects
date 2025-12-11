@@ -191,7 +191,7 @@ ISR(TIMER1_COMPA_vect) {
 
 ### 4.2.1 Симуляция в Tinkercad
 Проект доступен для онлайн-симуляции и проверки схемотехники.
-**[TinkerCad](https://www.tinkercad.com/things/8nXtkkncH9I-powerful-lappi)**
+**[TinkerCad](https://www.tinkercad.com/things/8nXtkkncH9I-powerful-lappi?sharecode=hEik5dqSBhg7P4V6IMOIvsJixSyYF-BSych-01cG56M)**
 
 ---
 
